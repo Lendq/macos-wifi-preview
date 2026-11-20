@@ -14,7 +14,7 @@ Open **Other Networks** to refresh the list with a Wi-Fi scan. macOS can require
 
 Click a network to simulate joining it, or click the connected network to simulate disconnecting. A secured network asks for a test password the first time you join it in the preview. Any nonempty entry works. The app discards the entry immediately and remembers only the network name.
 
-To put a phone hotspot in **Personal Hotspot**, make the phone broadcast its Wi-Fi network, click **Find a hotspot…** or expand **Other Networks**, then right-click the network and choose **Mark as Personal Hotspot**. The menu remembers the label and shows the row when that network is visible. The app uses the regular Wi-Fi scan, so devices discovered only through Apple's Instant Hotspot feature may be absent. Joining a hotspot uses the same cosmetic flow as joining any other network.
+Broadcasting hotspots that advertise the Apple Personal Hotspot marker appear automatically in **Personal Hotspot**. Devices available only through Apple's Instant Hotspot discovery may be absent. Joining a hotspot uses the same cosmetic flow as joining any other network.
 
 ## Build
 
@@ -25,3 +25,5 @@ With Xcode Command Line Tools installed, run:
 ```
 
 The app and ZIP appear in `build/`.
+
+For local builds, set `WIFI_ICON_SIGNING_IDENTITY` to a code-signing identity available on your Mac. Reuse the same identity across builds so macOS can recognize updates as the same app. Without it, builds are ad hoc signed and macOS may ask for permission again after an update.

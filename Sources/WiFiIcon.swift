@@ -8,6 +8,7 @@ private let previewWiFiKey = "PreviewWiFiOn"
 private struct PreviewNetwork: Identifiable, Equatable {
     let name: String
     let isSecure: Bool
+    var isHotspot = false
     var id: String { name }
 }
 
@@ -88,11 +89,6 @@ private final class NetworkDiscovery: NSObject, ObservableObject, CLLocationMana
         case idle, scanning, permissionNeeded, permissionUnavailable, failed
     }
 
-    private static let hotspotKey = "PreviewPersonalHotspots"
-
-    @Published private(set) var hotspotNames = Set(
-        UserDefaults.standard.stringArray(forKey: NetworkDiscovery.hotspotKey) ?? []
-    )
     @Published private(set) var currentNetwork: PreviewNetwork?
     @Published private(set) var nearby: [PreviewNetwork] = []
     @Published private(set) var status: Status = .idle
@@ -104,15 +100,6 @@ private final class NetworkDiscovery: NSObject, ObservableObject, CLLocationMana
     override init() {
         super.init()
         location.delegate = self
-    }
-
-    func toggleHotspot(_ name: String) {
-        if hotspotNames.contains(name) {
-            hotspotNames.remove(name)
-        } else {
-            hotspotNames.insert(name)
-        }
-        UserDefaults.standard.set(hotspotNames.sorted(), forKey: Self.hotspotKey)
     }
 
     func loadCachedNetworks() {
@@ -183,9 +170,28 @@ private final class NetworkDiscovery: NSObject, ObservableObject, CLLocationMana
         for network in results {
             guard let name = network.ssid, !name.isEmpty else { continue }
             let isSecure = !network.supportsSecurity(.none) || byName[name]?.isSecure == true
-            byName[name] = PreviewNetwork(name: name, isSecure: isSecure)
+            let isHotspot = byName[name]?.isHotspot == true
+                || Self.advertisesPersonalHotspot(network.informationElementData)
+            byName[name] = PreviewNetwork(name: name, isSecure: isSecure, isHotspot: isHotspot)
         }
         return byName.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    private static func advertisesPersonalHotspot(_ data: Data?) -> Bool {
+        guard let data else { return false }
+        let bytes = Array(data)
+        var offset = 0
+        while offset + 2 <= bytes.count {
+            let payload = offset + 2
+            let end = payload + Int(bytes[offset + 1])
+            guard end <= bytes.count else { return false }
+            // Vendor-specific element, Apple OUI 00:17:F2, Personal Hotspot type 6.
+            if bytes[offset] == 221, bytes[payload..<end].starts(with: [0x00, 0x17, 0xF2, 0x06]) {
+                return true
+            }
+            offset = end
+        }
+        return false
     }
 }
 
@@ -199,7 +205,11 @@ private struct WiFiPreview: View {
     @State private var showsOtherNetworks = false
     @State private var showsSettings = false
 
-    private var currentNetwork: PreviewNetwork? { discovery.currentNetwork }
+    private var currentNetwork: PreviewNetwork? {
+        guard var current = discovery.currentNetwork else { return nil }
+        current.isHotspot = discovery.nearby.contains { $0.name == current.name && $0.isHotspot }
+        return current
+    }
     let onChange: (Bool) -> Void
     let onResize: () -> Void
 
@@ -208,12 +218,12 @@ private struct WiFiPreview: View {
     }
 
     private var personalHotspots: [PreviewNetwork] {
-        visibleNetworks.filter { discovery.hotspotNames.contains($0.name) }
+        visibleNetworks.filter(\.isHotspot)
     }
 
     private var knownNetworks: [PreviewNetwork] {
         visibleNetworks.filter {
-            !discovery.hotspotNames.contains($0.name) &&
+            !$0.isHotspot &&
                 ($0.name == currentNetwork?.name || connection.remembered.contains($0.name) || connection.selected == $0.name)
         }
     }
@@ -244,8 +254,13 @@ private struct WiFiPreview: View {
                 .strokeBorder(Color.primary.opacity(0.12))
                 .allowsHitTesting(false)
         }
+        .onAppear {
+            if isOn { discovery.scan() }
+        }
         .onChange(of: isOn) { _, value in
-            if !value {
+            if value {
+                discovery.scan()
+            } else {
                 connection.cancel()
                 dismissPassword()
                 showsOtherNetworks = false
@@ -265,7 +280,6 @@ private struct WiFiPreview: View {
             onResize()
         }
         .onChange(of: discovery.nearby) { _, _ in onResize() }
-        .onChange(of: discovery.hotspotNames) { _, _ in onResize() }
         .onChange(of: discovery.status) { _, _ in onResize() }
         .onChange(of: showsSettings) { _, _ in onResize() }
     }
@@ -302,20 +316,13 @@ private struct WiFiPreview: View {
 
     private var networkSections: some View {
         Group {
-            VStack(alignment: .leading, spacing: 6) {
-                sectionLabel("Personal Hotspot")
-                if !personalHotspots.isEmpty {
+            if !personalHotspots.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    sectionLabel("Personal Hotspot")
                     networkList(personalHotspots)
-                } else if showsOtherNetworks {
-                    Text("Right-click your phone’s network to mark it as a hotspot.")
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else {
-                    Button("Find a hotspot…") { showsOtherNetworks = true }
-                        .buttonStyle(.link)
                 }
+                Divider()
             }
-            Divider()
 
             if !knownNetworks.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
@@ -481,7 +488,6 @@ private struct WiFiPreview: View {
     private func networkRow(_ network: PreviewNetwork) -> some View {
         let name = network.name
         let isCurrent = name == currentNetwork?.name
-        let isHotspot = discovery.hotspotNames.contains(name)
         let isSelected = connection.selected == name
         let status: String? = switch connection.transition {
         case .connecting(let target) where target == name: "Connecting…"
@@ -498,7 +504,7 @@ private struct WiFiPreview: View {
             }
         } label: {
             HStack(spacing: 8) {
-                Image(systemName: isHotspot ? "personalhotspot" : "wifi")
+                Image(systemName: network.isHotspot ? "personalhotspot" : "wifi")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(isSelected && isOn ? Color.white : Color.primary)
                     .frame(width: 25, height: 25)
@@ -536,11 +542,6 @@ private struct WiFiPreview: View {
         .accessibilityLabel(name)
         .accessibilityValue(status ?? (isSelected ? "Connected" : ""))
         .accessibilityHint(isSelected ? "Disconnect" : "Connect")
-        .contextMenu {
-            Button(isHotspot ? "Unmark Personal Hotspot" : "Mark as Personal Hotspot") {
-                discovery.toggleHotspot(name)
-            }
-        }
         .disabled(connection.transition != nil)
     }
 }

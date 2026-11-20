@@ -15,7 +15,7 @@ for architecture in arm64 x86_64; do
 done
 
 xcrun lipo -create "$build_dir/WiFiIcon-arm64" "$build_dir/WiFiIcon-x86_64" -output "$executable"
-codesign --force --sign - "$app"
+codesign --force --sign "${WIFI_ICON_SIGNING_IDENTITY:--}" "$app"
 codesign --verify --strict "$app"
 ditto -c -k --norsrc --noextattr --noacl --keepParent "$app" "$build_dir/Wi-Fi-Icon-macOS.zip"
 printf 'Built %s\n' "$build_dir/Wi-Fi-Icon-macOS.zip"
