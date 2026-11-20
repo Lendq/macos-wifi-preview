@@ -1,34 +1,233 @@
 import AppKit
+import CoreLocation
 import CoreWLAN
 import SwiftUI
 
 private let previewWiFiKey = "PreviewWiFiOn"
 
-private struct PreviewNetwork: Identifiable {
+private struct PreviewNetwork: Identifiable, Equatable {
     let name: String
     let isSecure: Bool
     var id: String { name }
 }
 
+private final class PreviewConnection: ObservableObject {
+    private static let selectionKey = "PreviewConnectionSelection"
+
+    enum Transition: Equatable {
+        case connecting(String)
+        case disconnecting(String)
+    }
+
+    @Published private(set) var selected: String?
+    @Published private(set) var transition: Transition?
+    @Published private(set) var remembered: Set<String>
+    private let defaults: UserDefaults
+    private var pending: Task<Void, Never>?
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        remembered = Set(defaults.stringArray(forKey: "PreviewRememberedNetworks") ?? [])
+        let previousSelection = defaults.string(forKey: Self.selectionKey)
+            ?? defaults.string(forKey: "PreviewSelectedNetwork")
+        if let previous = previousSelection, !previous.isEmpty {
+            selected = previous
+            remembered.insert(previous)
+        }
+    }
+
+    func useCurrentNetworkInitially(_ name: String?) {
+        guard defaults.string(forKey: Self.selectionKey) == nil,
+              selected == nil else { return }
+        selected = name
+    }
+
+    func connect(to name: String) {
+        schedule(.connecting(name), delay: 1_800) {
+            self.remembered.insert(name)
+            self.defaults.set(self.remembered.sorted(), forKey: "PreviewRememberedNetworks")
+            self.setSelection(name)
+        }
+    }
+
+    func disconnect(from name: String) {
+        schedule(.disconnecting(name), delay: 900) {
+            self.setSelection(nil)
+        }
+    }
+
+    func cancel() {
+        pending?.cancel()
+        pending = nil
+        transition = nil
+    }
+
+    private func setSelection(_ name: String?) {
+        selected = name
+        defaults.set(name ?? "", forKey: Self.selectionKey)
+    }
+
+    private func schedule(_ transition: Transition, delay: UInt64, finish: @escaping () -> Void) {
+        cancel()
+        self.transition = transition
+        pending = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .milliseconds(delay))
+            } catch {
+                return
+            }
+            finish()
+            self.transition = nil
+            self.pending = nil
+        }
+    }
+}
+
+private final class NetworkDiscovery: NSObject, ObservableObject, CLLocationManagerDelegate {
+    enum Status: Equatable {
+        case idle, scanning, permissionNeeded, permissionUnavailable, failed
+    }
+
+    private static let hotspotKey = "PreviewPersonalHotspots"
+
+    @Published private(set) var hotspotNames = Set(
+        UserDefaults.standard.stringArray(forKey: NetworkDiscovery.hotspotKey) ?? []
+    )
+    @Published private(set) var currentNetwork: PreviewNetwork?
+    @Published private(set) var nearby: [PreviewNetwork] = []
+    @Published private(set) var status: Status = .idle
+
+    private let location = CLLocationManager()
+    private let queue = DispatchQueue(label: "WiFiIcon.network-scan")
+    private var awaitingPermission = false
+
+    override init() {
+        super.init()
+        location.delegate = self
+    }
+
+    func toggleHotspot(_ name: String) {
+        if hotspotNames.contains(name) {
+            hotspotNames.remove(name)
+        } else {
+            hotspotNames.insert(name)
+        }
+        UserDefaults.standard.set(hotspotNames.sorted(), forKey: Self.hotspotKey)
+    }
+
+    func loadCachedNetworks() {
+        guard status != .scanning, let interface = CWWiFiClient.shared().interface() else { return }
+        updateCurrentNetwork(interface)
+        let cached = namedNetworks(interface.cachedScanResults() ?? [])
+        if !cached.isEmpty {
+            nearby = cached
+        }
+    }
+
+    func scan() {
+        guard status != .scanning else { return }
+        switch location.authorizationStatus {
+        case .notDetermined:
+            status = .permissionNeeded
+            return
+        case .denied, .restricted:
+            status = .permissionUnavailable
+            return
+        default:
+            break
+        }
+
+        status = .scanning
+        queue.async { [weak self] in
+            let interface = CWWiFiClient.shared().interface()
+            let results = try? interface?.scanForNetworks(withSSID: nil)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let interface {
+                    self.updateCurrentNetwork(interface)
+                }
+                if let results {
+                    self.nearby = self.namedNetworks(results)
+                    self.status = .idle
+                } else {
+                    self.status = .failed
+                }
+            }
+        }
+    }
+
+    func requestPermission() {
+        awaitingPermission = true
+        NSApp.activate()
+        location.requestWhenInUseAuthorization()
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        guard awaitingPermission || status == .permissionNeeded || status == .permissionUnavailable,
+              manager.authorizationStatus != .notDetermined else { return }
+        awaitingPermission = false
+        scan()
+    }
+
+    private func updateCurrentNetwork(_ interface: CWInterface) {
+        guard let name = interface.ssid(), !name.isEmpty else {
+            currentNetwork = nil
+            return
+        }
+        let security = interface.security()
+        currentNetwork = PreviewNetwork(name: name, isSecure: security != .none && security != .unknown)
+    }
+
+    private func namedNetworks(_ results: Set<CWNetwork>) -> [PreviewNetwork] {
+        var byName: [String: PreviewNetwork] = [:]
+        for network in results {
+            guard let name = network.ssid, !name.isEmpty else { continue }
+            let isSecure = !network.supportsSecurity(.none) || byName[name]?.isSecure == true
+            byName[name] = PreviewNetwork(name: name, isSecure: isSecure)
+        }
+        return byName.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+}
+
 private struct WiFiPreview: View {
-    @Environment(\.colorScheme) private var colorScheme
     @AppStorage(previewWiFiKey) private var isOn = false
-    @AppStorage("PreviewSelectedNetwork") private var savedSelection = ""
+    @ObservedObject var connection: PreviewConnection
+    @ObservedObject var discovery: NetworkDiscovery
+    @State private var passwordNetwork: PreviewNetwork?
+    @State private var password = ""
+    @FocusState private var passwordFocused: Bool
     @State private var showsOtherNetworks = false
     @State private var showsSettings = false
 
-    let currentNetwork: PreviewNetwork?
-    let otherNetworks: [PreviewNetwork]
+    private var currentNetwork: PreviewNetwork? { discovery.currentNetwork }
     let onChange: (Bool) -> Void
     let onResize: () -> Void
 
-    private var selection: String? {
-        otherNetworks.contains { $0.name == savedSelection } ? savedSelection : currentNetwork?.name
+    private var visibleNetworks: [PreviewNetwork] {
+        [currentNetwork].compactMap { $0 } + discovery.nearby.filter { $0.name != currentNetwork?.name }
+    }
+
+    private var personalHotspots: [PreviewNetwork] {
+        visibleNetworks.filter { discovery.hotspotNames.contains($0.name) }
+    }
+
+    private var knownNetworks: [PreviewNetwork] {
+        visibleNetworks.filter {
+            !discovery.hotspotNames.contains($0.name) &&
+                ($0.name == currentNetwork?.name || connection.remembered.contains($0.name) || connection.selected == $0.name)
+        }
+    }
+
+    private var availableNetworks: [PreviewNetwork] {
+        let sectionNames = Set((knownNetworks + personalHotspots).map(\.name))
+        return visibleNetworks.filter { !sectionNames.contains($0.name) }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if showsSettings {
+            if let passwordNetwork {
+                passwordPage(passwordNetwork)
+            } else if showsSettings {
                 settingsPage
             } else {
                 networksPage
@@ -40,14 +239,34 @@ private struct WiFiPreview: View {
         .frame(width: 300)
         .font(.system(size: 13))
         .fixedSize(horizontal: true, vertical: true)
-        .background(colorScheme == .dark ? Color(white: 0.075).opacity(0.84) : .clear)
         .overlay {
             RoundedRectangle(cornerRadius: 15)
                 .strokeBorder(Color.primary.opacity(0.12))
                 .allowsHitTesting(false)
         }
-        .onChange(of: isOn) { _, value in onChange(value) }
-        .onChange(of: showsOtherNetworks) { _, _ in onResize() }
+        .onChange(of: isOn) { _, value in
+            if !value {
+                connection.cancel()
+                dismissPassword()
+                showsOtherNetworks = false
+            }
+            onChange(value)
+            onResize()
+        }
+        .onChange(of: passwordNetwork?.name) { _, _ in onResize() }
+        .onChange(of: connection.selected) { _, _ in onResize() }
+        .onChange(of: connection.transition) { _, _ in onResize() }
+        .onChange(of: showsOtherNetworks) { _, expanded in
+            if expanded { discovery.scan() }
+            onResize()
+        }
+        .onChange(of: discovery.currentNetwork) { _, network in
+            connection.useCurrentNetworkInitially(network?.name)
+            onResize()
+        }
+        .onChange(of: discovery.nearby) { _, _ in onResize() }
+        .onChange(of: discovery.hotspotNames) { _, _ in onResize() }
+        .onChange(of: discovery.status) { _, _ in onResize() }
         .onChange(of: showsSettings) { _, _ in onResize() }
     }
 
@@ -61,17 +280,50 @@ private struct WiFiPreview: View {
 
             Divider().padding(.vertical, 1)
 
-            VStack(alignment: .leading, spacing: 6) {
-                sectionLabel("Known Network")
-                if let currentNetwork {
-                    networkRow(currentNetwork)
-                } else {
-                    Text("Network name unavailable")
-                        .foregroundStyle(.secondary)
-                }
+            if isOn {
+                networkSections
+                Divider()
             }
 
+            HStack {
+                menuButton("Wi-Fi Settings…") { showsSettings = true }
+                Spacer()
+                Menu {
+                    Button("Quit Wi-Fi Icon") { NSApp.terminate(nil) }
+                } label: {
+                    Image(systemName: "ellipsis.circle").accessibilityLabel("Wi-Fi Icon options")
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+            }
+        }
+    }
+
+    private var networkSections: some View {
+        Group {
+            VStack(alignment: .leading, spacing: 6) {
+                sectionLabel("Personal Hotspot")
+                if !personalHotspots.isEmpty {
+                    networkList(personalHotspots)
+                } else if showsOtherNetworks {
+                    Text("Right-click your phone’s network to mark it as a hotspot.")
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Button("Find a hotspot…") { showsOtherNetworks = true }
+                        .buttonStyle(.link)
+                }
+            }
             Divider()
+
+            if !knownNetworks.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    sectionLabel(knownNetworks.count == 1 ? "Known Network" : "Known Networks")
+                    networkList(knownNetworks)
+                }
+                Divider()
+            }
 
             Button {
                 showsOtherNetworks.toggle()
@@ -89,40 +341,80 @@ private struct WiFiPreview: View {
             .accessibilityValue(showsOtherNetworks ? "Expanded" : "Collapsed")
 
             if showsOtherNetworks {
-                if otherNetworks.isEmpty {
-                    Text("No nearby network names available")
+                if !availableNetworks.isEmpty {
+                    networkList(availableNetworks)
+                }
+                switch discovery.status {
+                case .scanning:
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Looking for networks…")
+                    }
+                    .foregroundStyle(.secondary)
+                case .permissionNeeded:
+                    Button("Allow Location Access…") { discovery.requestPermission() }
+                case .permissionUnavailable:
+                    Text("To see nearby network names, allow Wi-Fi Icon in System Settings → Privacy & Security → Location Services.")
                         .foregroundStyle(.secondary)
-                } else if otherNetworks.count > 7 {
-                    ScrollView { networkList }
-                        .frame(height: 200)
-                } else {
-                    networkList
+                        .fixedSize(horizontal: false, vertical: true)
+                case .failed:
+                    Button("Scan failed. Try again") { discovery.scan() }
+                case .idle:
+                    if availableNetworks.isEmpty {
+                        Text("No other networks found")
+                            .foregroundStyle(.secondary)
+                    }
                 }
-            }
-
-            Divider()
-
-            HStack {
-                menuButton("Wi-Fi Settings…") { showsSettings = true }
-                Spacer()
-                Menu {
-                    Button("Quit Wi-Fi Icon") { NSApp.terminate(nil) }
-                } label: {
-                    Image(systemName: "ellipsis.circle").accessibilityLabel("Wi-Fi Icon options")
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
             }
         }
     }
 
-    private var networkList: some View {
+    @ViewBuilder
+    private func networkList(_ networks: [PreviewNetwork]) -> some View {
+        if networks.count > 5 {
+            ScrollView { networkRows(networks) }
+                .contentMargins(.trailing, 10, for: .scrollContent)
+                .frame(height: 165)
+        } else {
+            networkRows(networks)
+        }
+    }
+
+    private func networkRows(_ networks: [PreviewNetwork]) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            ForEach(otherNetworks) { network in
+            ForEach(networks) { network in
                 networkRow(network)
             }
         }
+    }
+
+    private func passwordPage(_ network: PreviewNetwork) -> some View {
+        Group {
+            Text("Join Wi-Fi Network").font(.headline)
+            Text(network.name).fontWeight(.medium)
+            SecureField("Password", text: $password)
+                .focused($passwordFocused)
+                .onAppear { passwordFocused = true }
+                .onSubmit { submitPassword(for: network) }
+            HStack {
+                Spacer()
+                Button("Cancel", action: dismissPassword)
+                Button("Join") { submitPassword(for: network) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(password.isEmpty)
+            }
+        }
+    }
+
+    private func dismissPassword() {
+        password = ""
+        passwordNetwork = nil
+    }
+
+    private func submitPassword(for network: PreviewNetwork) {
+        guard !password.isEmpty else { return }
+        dismissPassword()
+        connection.connect(to: network.name)
     }
 
     private var settingsPage: some View {
@@ -134,9 +426,11 @@ private struct WiFiPreview: View {
                 Spacer()
                 wifiSwitch
             }
-            LabeledContent("Selected network", value: selection ?? "Unavailable")
-            Button("Use Current Network") { savedSelection = "" }
-                .disabled(currentNetwork == nil || savedSelection.isEmpty)
+            LabeledContent("Selected network", value: isOn ? connection.selected ?? "Disconnected" : "Off")
+            if let currentNetwork {
+                Button("Use Current Network") { connection.connect(to: currentNetwork.name) }
+                    .disabled(!isOn || connection.transition != nil || connection.selected == currentNetwork.name)
+            }
             Text("Changes apply only to this menu.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -187,19 +481,36 @@ private struct WiFiPreview: View {
     private func networkRow(_ network: PreviewNetwork) -> some View {
         let name = network.name
         let isCurrent = name == currentNetwork?.name
-        let isSelected = selection == name
+        let isHotspot = discovery.hotspotNames.contains(name)
+        let isSelected = connection.selected == name
+        let status: String? = switch connection.transition {
+        case .connecting(let target) where target == name: "Connecting…"
+        case .disconnecting(let target) where target == name: "Disconnecting…"
+        default: nil
+        }
         return Button {
-            savedSelection = isCurrent ? "" : name
+            if isSelected {
+                connection.disconnect(from: name)
+            } else if network.isSecure && !isCurrent && !connection.remembered.contains(name) {
+                passwordNetwork = network
+            } else {
+                connection.connect(to: name)
+            }
         } label: {
             HStack(spacing: 8) {
-                Image(systemName: "wifi")
+                Image(systemName: isHotspot ? "personalhotspot" : "wifi")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(isSelected && isOn ? Color.white : Color.primary)
                     .frame(width: 25, height: 25)
                     .background(isSelected && isOn ? Color.accentColor : Color.primary.opacity(0.12), in: Circle())
                     .accessibilityHidden(true)
 
-                Text(name).lineLimit(2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(name).lineLimit(2)
+                    if let status {
+                        Text(status).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 Spacer()
 
                 if network.isSecure {
@@ -208,7 +519,11 @@ private struct WiFiPreview: View {
                         .foregroundStyle(.secondary)
                         .accessibilityLabel("Secure network")
                 }
-                if isSelected && !isCurrent {
+                if status != nil {
+                    ProgressView().controlSize(.small).scaleEffect(0.65)
+                        .frame(width: 16, height: 16)
+                        .accessibilityHidden(true)
+                } else if isSelected && !isCurrent {
                     Image(systemName: "checkmark")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(isOn ? Color.accentColor : Color.secondary)
@@ -219,7 +534,14 @@ private struct WiFiPreview: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(name)
-        .accessibilityValue(isSelected ? "Selected" : "")
+        .accessibilityValue(status ?? (isSelected ? "Connected" : ""))
+        .accessibilityHint(isSelected ? "Disconnect" : "Connect")
+        .contextMenu {
+            Button(isHotspot ? "Unmark Personal Hotspot" : "Mark as Personal Hotspot") {
+                discovery.toggleHotspot(name)
+            }
+        }
+        .disabled(connection.transition != nil)
     }
 }
 
@@ -228,6 +550,8 @@ private final class WiFiPanel: NSPanel {
 }
 
 final class MenuBarIcon: NSObject, NSApplicationDelegate {
+    private let connection = PreviewConnection()
+    private let discovery = NetworkDiscovery()
     private var statusItem: NSStatusItem?
     private var panel: WiFiPanel?
     private var hostingView: NSHostingView<WiFiPreview>?
@@ -298,23 +622,11 @@ final class MenuBarIcon: NSObject, NSApplicationDelegate {
             NSApp.unhideWithoutActivation()
         }
 
-        let interface = CWWiFiClient.shared().interface()
-        var currentNetwork: PreviewNetwork?
-        if let interface, let name = interface.ssid(), !name.isEmpty {
-            let security = interface.security()
-            currentNetwork = PreviewNetwork(name: name, isSecure: security != .none && security != .unknown)
-        }
-
-        var nearby: [String: PreviewNetwork] = [:]
-        for network in interface?.cachedScanResults() ?? [] {
-            guard let name = network.ssid, !name.isEmpty, name != currentNetwork?.name else { continue }
-            let isSecure = !network.supportsSecurity(.none) || nearby[name]?.isSecure == true
-            nearby[name] = PreviewNetwork(name: name, isSecure: isSecure)
-        }
-
+        discovery.loadCachedNetworks()
+        connection.useCurrentNetworkInitially(discovery.currentNetwork?.name)
         let hostingView = NSHostingView(rootView: WiFiPreview(
-            currentNetwork: currentNetwork,
-            otherNetworks: nearby.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending },
+            connection: connection,
+            discovery: discovery,
             onChange: { [weak self] in self?.updateIcon(isOn: $0) },
             onResize: { [weak self] in
                 DispatchQueue.main.async { self?.positionPanel() }
@@ -323,7 +635,7 @@ final class MenuBarIcon: NSObject, NSApplicationDelegate {
         hostingView.safeAreaRegions = []
 
         let background = NSVisualEffectView()
-        background.material = .popover
+        background.material = .menu
         background.blendingMode = .behindWindow
         background.state = .active
         background.wantsLayer = true

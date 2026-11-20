@@ -16,6 +16,10 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
+    <key>NSLocationUsageDescription</key>
+    <string>Wi-Fi Icon uses Location Services permission to display nearby Wi-Fi network names.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Wi-Fi Icon uses Location Services permission to display nearby Wi-Fi network names.</string>
     <key>LSUIElement</key>
     <true/>
 </dict>

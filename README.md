@@ -10,7 +10,11 @@ Wi-Fi Icon is a small macOS menu bar app with a cosmetic Wi-Fi switch. The switc
 
 The ZIP contains a universal app for Apple silicon and Intel Macs running macOS 14 or later. This build is locally signed and has no Apple notarization. macOS may block it on first launch. [Apple explains how it handles downloaded apps.](https://support.apple.com/en-us/102445)
 
-Network names appear when macOS makes the current connection and cached Wi-Fi results available to the app. Some systems withhold those names. The preview switch still works in that case. The app ships without bundled network names and stores its switch and network selection locally.
+Open **Other Networks** to refresh the list with a Wi-Fi scan. macOS can require Location Services permission to reveal network names. Use **Allow Location Access…** in the menu if prompted. The preview switch works without that permission. The app ships without bundled network names. It remembers the cosmetic switch, selected network, and previously joined names locally.
+
+Click a network to simulate joining it, or click the connected network to simulate disconnecting. A secured network asks for a test password the first time you join it in the preview. Any nonempty entry works. The app discards the entry immediately and remembers only the network name.
+
+To put a phone hotspot in **Personal Hotspot**, make the phone broadcast its Wi-Fi network, click **Find a hotspot…** or expand **Other Networks**, then right-click the network and choose **Mark as Personal Hotspot**. The menu remembers the label and shows the row when that network is visible. The app uses the regular Wi-Fi scan, so devices discovered only through Apple's Instant Hotspot feature may be absent. Joining a hotspot uses the same cosmetic flow as joining any other network.
 
 ## Build
 
